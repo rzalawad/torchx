@@ -188,7 +188,9 @@ def sanitize_for_serialization(obj: object) -> object:
     return api.sanitize_for_serialization(obj)
 
 
-def role_to_pod(name: str, role: Role, service_account: Optional[str]) -> "V1Pod":
+def role_to_pod(
+    name: str, role: Role, service_account: Optional[str], node_selector: Optional[Dict[str, str]]
+) -> "V1Pod":
     from kubernetes.client.models import (  # noqa: F811 redefinition of unused
         V1Container,
         V1ContainerPort,
@@ -235,7 +237,7 @@ def role_to_pod(name: str, role: Role, service_account: Optional[str]) -> "V1Pod
         requests=requests,
     )
 
-    node_selector: Dict[str, str] = {}
+    node_selector = node_selector or {}
     if LABEL_INSTANCE_TYPE in resource.capabilities:
         node_selector[LABEL_INSTANCE_TYPE] = resource.capabilities[LABEL_INSTANCE_TYPE]
 
@@ -302,9 +304,7 @@ def role_to_pod(name: str, role: Role, service_account: Optional[str]) -> "V1Pod
                 V1VolumeMount(
                     name=mount_name,
                     mount_path=mount.dst_path,
-                    read_only=(
-                        "w" not in mount.permissions and "m" not in mount.permissions
-                    ),
+                    read_only=("w" not in mount.permissions and "m" not in mount.permissions),
                 )
             )
             security_context.privileged = True
@@ -369,6 +369,7 @@ def app_to_resource(
     queue: str,
     service_account: Optional[str],
     priority_class: Optional[str] = None,
+    node_selector: Optional[Dict[str, str]] = None,
 ) -> Dict[str, object]:
     """
     app_to_resource creates a volcano job kubernetes resource definition from
@@ -400,7 +401,7 @@ def app_to_resource(
             if role_idx == 0 and replica_id == 0:
                 replica_role.env["TORCHX_RANK0_HOST"] = "localhost"
 
-            pod = role_to_pod(name, replica_role, service_account)
+            pod = role_to_pod(name, replica_role, service_account, node_selector)
             pod.metadata.labels.update(
                 pod_labels(
                     app=app,
@@ -470,6 +471,7 @@ class KubernetesOpts(TypedDict, total=False):
     image_repo: Optional[str]
     service_account: Optional[str]
     priority_class: Optional[str]
+    node_selector: Optional[Dict[str, str]]
 
 
 class KubernetesScheduler(DockerWorkspaceMixin, Scheduler[KubernetesOpts]):
@@ -634,9 +636,7 @@ class KubernetesScheduler(DockerWorkspaceMixin, Scheduler[KubernetesOpts]):
 
         return f'{namespace}:{resp["metadata"]["name"]}'
 
-    def _submit_dryrun(
-        self, app: AppDef, cfg: KubernetesOpts
-    ) -> AppDryRunInfo[KubernetesJob]:
+    def _submit_dryrun(self, app: AppDef, cfg: KubernetesOpts) -> AppDryRunInfo[KubernetesJob]:
         queue = cfg.get("queue")
         if not isinstance(queue, str):
             raise TypeError(f"config value 'queue' must be a string, got {queue}")
@@ -654,7 +654,12 @@ class KubernetesScheduler(DockerWorkspaceMixin, Scheduler[KubernetesOpts]):
             priority_class, str
         ), "priority_class must be a str"
 
-        resource = app_to_resource(app, queue, service_account, priority_class)
+        node_selector = cfg.get("node_selector")
+        assert node_selector is None or isinstance(
+            node_selector, Dict
+        ), "node_selector must be a Dict"
+
+        resource = app_to_resource(app, queue, service_account, priority_class, node_selector)
         req = KubernetesJob(
             resource=resource,
             images_to_push=images_to_push,
@@ -698,6 +703,14 @@ class KubernetesScheduler(DockerWorkspaceMixin, Scheduler[KubernetesOpts]):
             "priority_class",
             type_=str,
             help="The name of the PriorityClass to set on the job specs",
+        )
+        opts.add(
+            "node_selector",
+            type_=Dict[str, str],
+            default=None,
+            help="""Node selector to be passed to the job. The separator sign can be eiher comma or semicolon
+            (e.g. SELECTOR1:V1,SELECTOR2:V2,SELECTOR3:V3 or SELECTOR1:V1;SELECTOR2:V2 ).
+            Instance type capability will be applied on top of this setting.""",
         )
         return opts
 
